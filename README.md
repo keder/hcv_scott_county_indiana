@@ -1,1 +1,3 @@
-# hcv_scott_county_indiana
+# HCV retrospective study for Scott COunty Indiana
+
+This is repository for the paper of HCV outbreak investigation.
