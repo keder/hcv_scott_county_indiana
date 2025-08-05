@@ -1,0 +1,1694 @@
+# Incidence and Mortality Forecasting with Google Trends as external regressors
+
+## Preparation
+
+This is section that is required for all other sections.
+
+First, we need to load all nessessary libraraies.
+```{r}
+library("xtable")
+library("lmtest")
+library("dplyr")
+library("pheatmap")
+library("grid")
+library("tidyr")
+library("parallel")
+library("prophet")
+library("forecast")
+library("xgboost")
+library("boot")
+library("dtw")
+library("lubridate")
+library("purrr")
+library("readr")
+library("scoringutils")
+library("stats")
+library("parallel")
+library("grid")
+library("stringr")
+library("ggplot2")
+library("knitr")
+library("cowplot")
+library("gridExtra")
+library("ggplotify")
+```
+
+Here we initialize all variables that are common for all other sections.
+
+```{r}
+# Date cutoffs
+
+
+# overall_causes_mortality <- paste(mortality_trend_dir, "total_mortality.csv", sep = "/")
+# Where output plots to
+plot_dir <- "./plots"
+
+output_dir <- "./R_Data"
+
+# How much best predicting trends to select
+
+# Number of time points that we use to train/fit/calibrate model.
+# Could be a vector of multiple lenghts
+# Make sure that fit_lengths + horizons do not exceed size of the time series!
+# fit_lengths <- 12:34
+min_fit_length <- 12
+# How many predictions forward we need to issue. Could be a vector of multiple horizons.
+horizons <- c(3, 6, 12)
+# If set TRUE, it will use rolling windows of fit_lengths sizes to issue predictions.
+# Performance will be averaged for each fit_lengths value
+rolling_window <- FALSE
+
+# Specifies number of threads to do computations in parallel.
+# No parallelism in Windows, however. Set to 1 to not use parallelism.
+cores <- 1
+# Sets size of the bootstrap sample
+# Boostrap size of 0 turns off bootstrapping
+bootstrap_size <- 0
+# bootstrap_size <- 10
+# model_params <- list(
+#     arima_pred = list(max.p=12)
+# )
+# Use cumulative or differential data? Note that input data ALWAYS should be differential (incidence)!
+# For ARIMA and XGBoost it is advised to use differential, for Prophet it is cumulative.
+cumm_data <- FALSE
+prediction_plots <- TRUE
+# You can select transformation of data before fit and after fit/prediction. Values: "boxcox" and "disabled".
+# For prophet it is strongly recommended to disable transformation.
+
+# hcv_type <- "1a"
+# hcv_type <- "3a"
+hcv_type <- "combined"
+hcv_prefix <- paste0(hcv_type, "_")
+
+set.seed(1234)
+```
+
+Here we define some common utility functions.
+
+```{r}
+limit_signif_digits <- function(x) {
+    digits_after_point <- 2
+    formatted <- ifelse(abs(x) < 10^(digits_after_point - 1),
+        signif(x, digits = digits_after_point), round(x)
+    )
+    sub("\\.?0+$", "", format(formatted, scientific = FALSE, trim = TRUE))
+}
+
+# Time series scaler
+my_scale <- function(data) {
+    if (all(data == 0)) {
+        warning("Zero sequence scaling")
+        return(as.numeric(data))
+    }
+    result <- 100 * data / mean(data)
+    return(result)
+    # sigma <- sd(data)
+    # mu <- mean(data)
+    # return(((data - mu) / sigma + 3) * 100 / 6)
+}
+
+create_lagged_features <- function(df, lags) {
+    result <- NULL
+    df <- as.data.frame(df)
+
+    for (i in 2:ncol(df)) {
+        col_values <- as.vector(df[, i])
+        curr_lag <- lags[i - 1]
+        # col_name <- names(df)[i]
+
+        lagged <- embed(col_values, curr_lag + 1)
+        # print(lagged)
+        diff_features <- apply(lagged[, -1], 1, function(x) rev(diff(rev(x))))
+        if (is.matrix(diff_features)) {
+            diff_features <- t(diff_features)
+        } else {
+            diff_features <- as.matrix(diff_features)
+        }
+        future_growth <- as.matrix(apply(lagged[, c(1, 2)], 1, function(x) rev(diff(rev(x)))))
+        # print(result)
+        # print(future_growth)
+        # print(lagged[, 2])
+        # print(diff_features)
+        if (is.null(result)) {
+            result <- cbind(future_growth, lagged[, 2], diff_features)
+        } else {
+            result <- cbind(result, future_growth, lagged[, 2], diff_features)
+        }
+        # print(result)
+        # stop()
+        # names(iteration_result) <- paste0(col_name, ".lag(", (curr_lag - 1) : 0, )
+    }
+    return(result)
+}
+
+synchronize <- function(result_parallel) {
+    while (cores > 1 && !all(sapply(result_parallel, function(x) inherits(x, "try-error")))) {
+        Sys.sleep(1)
+    }
+}
+
+improve_model_name <- function(model_name) {
+    model_names <- c(
+        "arima" = "ARIMA",
+        "prophet" = "Prophet",
+        "xgboost" = "XGBoost"
+    )
+    return(model_names[model_name])
+}
+```
+
+## Data load
+
+Common variables for this section.
+
+```{r}
+skyline_table_file <- paste0("./Beast/", hcv_prefix, "skyline_data.txt")
+skyline_data_file <- paste0("./R_Data/", hcv_prefix, "skyline_data.RData")
+```
+
+```{r}
+skyline_df <- read.csv(file = skyline_table_file, sep = "\t")
+skyline_df <- skyline_df %>%
+    mutate(ds = as.Date(date)) %>%
+    select(c("ds", "median")) %>%
+    arrange(ds)
+names(skyline_df) <- c("ds", "data")
+skyline_df <- skyline_df %>%
+    na.omit() %>%
+    mutate(data = my_scale(data))
+save(skyline_df, file = skyline_data_file)
+```
+
+```{r}
+load(file = skyline_data_file)
+```
+
+```{r}
+arbitrary_start_point <- as.Date("2009-12-01")
+skyline_start_date <- min(skyline_df$ds)
+skyline_end_date <- max(skyline_df$ds)
+```
+
+
+Interpolate data and then make it monthly. Also compute how many predictions we want to issue.
+
+```{r}
+loess_model <- loess(data ~ as.numeric(ds), data = skyline_df, span = 0.2)
+monthly_dates <- seq(
+    from = floor_date(skyline_start_date, "month"),
+    to = floor_date(skyline_end_date, "month"),
+    by = "1 month"
+)
+monthly_data <- predict(loess_model, as.numeric(monthly_dates))
+monthly_skyline_df <- data.frame(
+    ds = monthly_dates,
+    data = monthly_data
+)
+monthly_skyline_df$data[1] <- skyline_df$data[1]
+
+fit_lengths <- min_fit_length:(nrow(monthly_skyline_df) - max(horizons))
+```
+
+Extend skyline data to be comparable with the Google Trends data.
+
+```{r}
+missing_dates <- seq(arbitrary_start_point, min(monthly_skyline_df$ds) - months(1), by = "1 month")
+df_extended <- data.frame(
+    ds = missing_dates,
+    data = monthly_skyline_df$data[1] # Repeat the first value
+)
+extended_monthly_skyline_df <- bind_rows(df_extended, monthly_skyline_df)
+```
+
+
+```{r}
+path <- "Data/google_trends"
+
+# Get a list of CSV files
+files <- list.files(path, pattern = "\\.csv$", full.names = TRUE)
+
+# Read all CSV files and add a filename column
+full_trends_df <- bind_rows(lapply(files, function(f) {
+    read.csv(f) %>% mutate(filename = sub("\\.csv$", "", basename(f)))
+})) %>%
+    mutate(ds = as.Date(paste0(ds, "-01"))) %>%
+    filter(ds < skyline_end_date) %>%
+    mutate(data = my_scale(data)) %>%
+    mutate(
+        location = if_else(
+            str_ends(filename, "_indiana"),
+            "Indiana",
+            "Louisville, Kentucky"
+        )
+    ) %>%
+    mutate(
+        term = if_else(
+            str_starts(filename, "opana_"),
+            "opana",
+            "oxymorphone"
+        )
+    )
+
+trends_df <- full_trends_df %>%
+    filter(ds > arbitrary_start_point & ds < skyline_end_date)
+
+full_smoothed_trends_df <- full_trends_df %>%
+    group_by(filename) %>%
+    mutate(data = predict(loess(data ~ as.numeric(ds), span = 0.2)))
+
+smoothed_trends_df <- full_smoothed_trends_df %>%
+    filter(ds > arbitrary_start_point & ds < skyline_end_date)
+```
+
+
+## Time series comparison
+
+Here we use cross-correlation function to find time shift where time series are most correlated. 
+This time would be our lag between search interest and viral population increase.
+
+```{r}
+ccf_wrap <- function(one, another) {
+    result <- ccf(one$data, another$data, plot = FALSE, lag.max = nrow(one) - 1)
+    return(data.frame(
+        lag = result$lag[, 1, 1], # Extract lag values
+        acf = result$acf[, 1, 1] # Extract correlation values
+    ))
+}
+
+ccf_results <- trends_df %>%
+    group_by(filename) %>%
+    group_modify(~ ccf_wrap(.x, extended_monthly_skyline_df)) %>%
+    mutate(
+        location = if_else(
+            str_ends(filename, "_indiana"),
+            "Indiana",
+            "Louisville, Kentucky"
+        )
+    ) %>%
+    mutate(
+        term = if_else(
+            str_starts(filename, "opana_"),
+            "opana",
+            "oxymorphone"
+        )
+    )
+
+max_lags <- ccf_results %>%
+    group_by(filename) %>%
+    slice_max(order_by = acf, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+new_startpoint <- min(monthly_skyline_df$ds) %m+% (months(min(max_lags$lag)) - 1)
+trends_df <- full_trends_df %>%
+    filter(ds > new_startpoint & ds < skyline_end_date)
+smoothed_trends_df <- full_smoothed_trends_df %>%
+    filter(ds > new_startpoint & ds < skyline_end_date)
+
+write.csv(ccf_results, paste0("results/", hcv_prefix, "ccf.csv"), row.names = FALSE)
+```
+
+```{r}
+tmp_df <- max_lags %>%
+    select("term", "location", "acf", "lag") %>%
+    mutate(acf = limit_signif_digits(acf)) %>%
+    data.frame()
+
+nice_names <- c(
+    "term" = "Search Phrase",
+    "location" = "Location",
+    "acf" = "Cross-Correlation",
+    "lag" = "Lag"
+)
+
+max_lag_latex_table <- kable(
+    tmp_df,
+    format = "latex",
+    booktabs = TRUE,
+    col.names = nice_names
+)
+
+writeLines(max_lag_latex_table, paste0("results/", hcv_prefix, "max_lags.tex"))
+```
+
+Here we plot cross-correlation coefficient against lag to get a full picture.
+
+```{r}
+plots <- list()
+terms <- unique(ccf_results$term)
+for (i in seq_along(terms)) {
+    t <- terms[i]
+    df <- ccf_results %>% filter(term == t)
+    p <- ggplot() +
+        ggtitle(paste0("Cross-correlation between Population Size and Google Trend '", t, "' across All Possible Lags")) +
+        theme_classic(base_size = 12) +
+        labs(
+            # title = paste("Time Series for", file),
+            x = "Lag",
+            y = "Cross-correlation"
+        ) +
+        scale_x_continuous(breaks = seq(min(df$lag), max(df$lag), by = 10)) +
+        theme(
+            axis.text = element_text(color = "black"),
+            axis.title = element_text(face = "bold"),
+            panel.border = element_rect(color = "black", fill = NA, size = 0.8)
+        ) +
+        labs(color = "Location")
+
+    for (loc in unique(df$location)) {
+        p <- p + geom_point(
+            data = df %>% filter(location == loc),
+            aes(x = lag, y = acf, color = location), size = 1, shape = 16
+        )
+    }
+    p <- p + scale_color_manual(values = c("#1f77b4", "#d62728")) +
+        theme(
+            legend.position = c(0.92, 0.77), # Position the legend inside the plot (coordinates: 0 to 1)
+            legend.background = element_rect(fill = "white", color = "black", size = 0.5), # Add a border around the legend
+            legend.title = element_text(size = 12), # Customize legend title text
+            legend.text = element_text(size = 10), # Customize legend label text
+            plot.title = element_text(hjust = 0.5, size = 16)
+        )
+
+    plots[[i]] <- p
+}
+combined <- plot_grid(plotlist = plots, ncol = 1, labels = "AUTO", label_size = 24)
+ggsave(
+    filename = paste0(plot_dir, "/", hcv_prefix, "cross_correlation.pdf"),
+    plot = combined,
+    width = 15,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+)
+```
+
+We will start with Granger test. We will get p-values and F-statistics. We need to adjust p-values to false discovery rate.
+
+```{r}
+gr_test <- function(one, another) {
+    tmp_df <- data.frame(ds = one$ds, x = one$data, y = another$data)
+    result <- grangertest(y ~ x, order = 3, data = tmp_df)
+    # What an ugly output structure!
+    return(data.frame(
+        f_stat = result$"F"[2],
+        p_value = result$"Pr(>F)"[2]
+    ))
+}
+
+all_granger_results <- list()
+
+for (file in unique(trends_df$filename)) {
+    max_lag <- max_lags %>%
+        filter(filename == file) %>%
+        pull(2)
+    shifted_skyline <- monthly_skyline_df %>%
+        mutate(ds = ds %m+% months(max_lag))
+    granger_results <- trends_df %>%
+        filter(filename == file) %>%
+        filter(ds >= min(shifted_skyline$ds) & ds <= max(shifted_skyline$ds)) %>%
+        group_modify(~ gr_test(.x, shifted_skyline)) %>%
+        mutate(filename = file, smoothed = "no")
+    granger_results <- rbind(
+        granger_results,
+        smoothed_trends_df %>%
+            filter(filename == file) %>%
+            filter(ds >= min(shifted_skyline$ds) & ds <= max(shifted_skyline$ds)) %>%
+            group_modify(~ gr_test(.x, shifted_skyline)) %>%
+            mutate(filename = file, smoothed = "yes")
+    )
+    # print(granger_results)
+    all_granger_results[[file]] <- granger_results
+}
+
+final_granger_results <- bind_rows(all_granger_results)
+```
+
+Next we produce LaTeX table for the results of the Granger test.
+
+```{r}
+granger_table <- final_granger_results %>%
+    select(c("filename", "p_value", "smoothed")) %>%
+    mutate(p_value = limit_signif_digits(p_value)) %>%
+    pivot_wider(names_from = smoothed, names_prefix = "smoothed_", values_from = p_value) %>%
+    mutate(
+        location = if_else(
+            str_ends(filename, "_indiana"),
+            "Indiana",
+            "Louisville, Kentucky"
+        )
+    ) %>%
+    mutate(
+        term = if_else(
+            str_starts(filename, "opana_"),
+            "opana",
+            "oxymorphone"
+        )
+    ) %>%
+    select(c("term", "location", "smoothed_no", "smoothed_yes"))
+
+nice_names <- c(
+    "Search Phrase",
+    "Location",
+    "$p_{GR}$",
+    "$p_{GR(Sm)}$"
+)
+
+granger_latex_table <- kable(
+    granger_table,
+    format = "latex",
+    booktabs = TRUE,
+    col.names = nice_names
+)
+
+writeLines(granger_latex_table, paste0("results/", hcv_prefix, "granger_test.tex"))
+```
+
+Side-by-side plots.
+
+```{r}
+if (!dir.exists(plot_dir)) dir.create(plot_dir)
+plots <- list()
+# Loop over unique filenames and generate individual plots
+filenames <- unique(trends_df$filename)
+legend_order <- c(
+    "Smoothed Google Trends data", "Google Trends data",
+    "Population size estimate", "Shifted population size estimate"
+)
+for (i in seq_along(filenames)) {
+    file <- filenames[i]
+    tdf <- trends_df %>% filter(filename == file)
+    location <- tdf[1, ] %>% pull("location")
+    term <- tdf[1, ] %>% pull("term")
+    max_lag <- max_lags %>%
+        filter(filename == file) %>%
+        pull(2)
+    shifted_skyline <- monthly_skyline_df %>%
+        mutate(ds = ds %m+% months(max_lag))
+    p <- ggplot(smoothed_trends_df %>% filter(filename == file)) +
+        ggtitle(paste0("Population Size and Google Trend '", term, "' in ", location)) +
+        geom_line(aes(x = ds, y = data, color = "Smoothed Google Trends data"), size = 1) +
+        geom_point(data = trends_df %>% filter(filename == file), aes(x = ds, y = data, color = "Google Trends data"), shape = 16, size = 1.5) +
+        geom_line(data = monthly_skyline_df, aes(x = ds, y = data, color = "Population size estimate"), size = 1) +
+        geom_line(data = shifted_skyline, aes(x = ds, y = data, color = "Shifted population size estimate"), linetype = "dashed", size = 1) +
+        theme_classic(base_size = 12) +
+        labs(
+            # title = paste("Time Series for", file),
+            x = "Date",
+            y = "Standardized Value"
+        ) +
+        scale_x_date(date_labels = "%Y-%m", date_breaks = "6 months") +
+        scale_color_manual(
+            values = c(
+                "Smoothed Google Trends data" = "#1f77b4",
+                "Google Trends data" = "#5f93b7",
+                "Population size estimate" = "#d62728",
+                "Shifted population size estimate" = "#d62728"
+            ),
+            breaks = legend_order,
+            guide = guide_legend(title = NULL)
+        ) +
+        theme(
+            axis.text = element_text(color = "black"),
+            axis.title = element_text(face = "bold"),
+            panel.border = element_rect(color = "black", fill = NA, size = 0.8),
+            legend.position = c(0.10, 0.75), # Position the legend inside the plot (coordinates: 0 to 1)
+            legend.background = element_rect(fill = "white", color = "black", size = 0.5), # Add a border around the legend
+            legend.title = element_text(size = 12), # Customize legend title text
+            legend.text = element_text(size = 10), # Customize legend label text
+            plot.title = element_text(hjust = 0.5, size = 16)
+        )
+
+    plots[[i]] <- p
+}
+combined <- plot_grid(plotlist = plots, ncol = 1, labels = "AUTO", label_size = 24)
+ggsave(filename = paste0(plot_dir, "/", hcv_prefix, "side_by_side.pdf"), plot = combined, width = 15, height = 15, dpi = 300, bg = "white")
+```
+
+## Foreascting
+
+Define Box-Cox transform. This transformation is from the family of power transformations, 
+allowing to stabilize variance, thus making data more like normally distributed. 
+For some models it improves forecast metrics significantly.
+
+```{r}
+box_cox <- list()
+box_cox$transform <- function(input_data, params = NULL, ...) {
+    if (is.null(params)) {
+        params <- list()
+        params$lambda <- BoxCox.lambda(input_data + 1, method = "loglik")
+    }
+    result <- list(data = BoxCox(input_data + 1, params$lambda), params = params)
+    return(result)
+}
+
+box_cox$inverse <- function(input_data, params) {
+    result <- InvBoxCox(x = input_data, lambda = params$lambda) - 1
+    return(result)
+}
+```
+
+Here we use adapter design pattern to make forecast model interfaces more uniform. 
+Input data for both "model.fit" and "model.forecast" should be a data.frame. 
+First column is date, second is dependent variable 
+(only for "model.fit", for "model.forecast" only dates and external regressors are required),
+rest are external regressors.
+
+```{r}
+.fit_arima <- function(df, ...) {
+    # print(df)
+    # stop()
+    fit_data <- df[2]
+    if (ncol(df) > 2) {
+        xreg <- as.matrix(df[, -c(1, 2)])
+    } else {
+        xreg <- NULL
+    }
+    # print(fit_data)
+    # print(list(...))
+    # print(xreg)
+    obj <- auto.arima(fit_data,
+        # d = 2,
+        # D = 2,
+        # ic = "aic",
+        max.p = length(fit_data),
+        max.q = length(fit_data),
+        start.p = length(fit_data) %/% 2,
+        start.q = length(fit_data) %/% 2,
+        max.P = length(fit_data),
+        max.Q = length(fit_data),
+        start.P = length(fit_data) %/% 2,
+        start.Q = length(fit_data) %/% 2,
+        # max.d = 4,
+        # approximation = FALSE,
+        # stepwise = FALSE,
+        # stationary = TRUE,
+        xreg = xreg,
+        # seasonal = FALSE,
+        # allowdrift = FALSE,
+        # lambda = "auto",
+        ...
+    )
+    # print(obj)
+    obj$fit <- data.frame(
+        ds = df[, 1],
+        yhat = as.numeric(obj$fitted),
+        yhat_lower = NA,
+        yhat_upper = NA
+    )
+
+    return(obj)
+}
+
+.predict_arima <- function(obj, df) {
+    forecast_length <- nrow(df)
+    # print(xreg)
+    if (ncol(df) > 1) {
+        xreg <- as.matrix(df[, -1])
+    } else {
+        xreg <- NULL
+    }
+    prediction <- forecast(obj, xreg = xreg, h = forecast_length)
+    prediction_lower <- prediction$lower[, 2]
+    prediction_upper <- prediction$upper[, 2]
+    # print(prediction$lower)
+    # print(attributes(yhat_lower))
+    # print(as.numeric(yhat_lower))
+    # names(yhat) <- NULL
+    # names(yhat_lower) <- NULL
+    # names(yhat_upper) <- NULL
+    # print(result$mean)
+    # print(obj$fitted)
+    result <- data.frame(
+        ds = df[, 1],
+        yhat = as.numeric(prediction$mean),
+        yhat_lower = as.numeric(prediction_lower),
+        yhat_upper = as.numeric(prediction_upper)
+    )
+    # print(obj$fit)
+    # print(result)
+    # readline()
+    # result <- result[2:length(result)]
+    # readline()
+    return(result)
+}
+
+.fit_prophet <- function(df, ...) {
+    # print(df)
+    names(df)[1] <- "ds"
+    names(df)[2] <- "y"
+    obj <- prophet(
+        # yearly.seasonality = TRUE,
+        yearly.seasonality = 4,
+        weekly.seasonality = FALSE,
+        daily.seasonality = FALSE,
+        # seasonality.prior.scale = 3,
+        # interval.width = 0.1,
+        # changepoint.range = 0.45,
+        fit = FALSE
+    )
+    for (xreg_name in names(df)[-c(1, 2)]) {
+        obj <- add_regressor(
+            obj,
+            xreg_name
+        )
+    }
+    obj <- fit.prophet(obj, df)
+    fit <- predict(obj, df)
+    obj$fit <- data.frame(
+        ds = df[, 1],
+        yhat = as.numeric(fit$yhat),
+        yhat_lower = as.numeric(fit$yhat_lower),
+        yhat_upper = as.numeric(fit$yhat_upper)
+    )
+    # print(obj$fit)
+    # print(obj)
+    # stop()
+    return(obj)
+}
+
+.predict_prophet <- function(obj, df) {
+    result <- predict(obj, df) %>%
+        select(ds, yhat, yhat_lower, yhat_upper) %>%
+        as.data.frame()
+
+    # print(result)
+    # stop()
+
+    return(result)
+}
+
+.fit_xgboost <- function(df, lags = 5, ...) {
+    # print(df)
+    df <- as.data.frame(df)
+    lagged_features <- create_lagged_features(df, rep(lags, ncol(df) - 1))
+    # print(lagged_features)
+    # stop()
+
+    train_data <- lagged_features[, -1]
+    train_labels <- lagged_features[, 1]
+    # print(train_data)
+
+    best_model <- xgboost(
+        params = list(
+            eta = 0.1,
+            subsample = 0.80,
+            colsample_bytree = 0.85,
+            max_depth = 10
+        ),
+        data = train_data,
+        label = train_labels,
+        nrounds = 100,
+        objective = "reg:squarederror",
+        early_stopping_rounds = 50,
+        verbose = 0
+    )
+    best_model$lags <- lags
+    if (ncol(df) > 2) {
+        best_model$xreg <- df[, -c(1, 2), drop = FALSE]
+    } else {
+        best_model$xreg <- NULL
+    }
+
+    fit_pred <- predict(best_model, train_data)
+    # print(c(df[, 2]))
+    # print(c(df[1:(best_model$lags - 1), 2], train_data[, 1] + fit_pred))
+    best_model$fit <- data.frame(
+        ds = df$ds,
+        yhat = c(df[1:best_model$lags, 2], train_data[, 1] + fit_pred),
+        yhat_lower = NA,
+        yhat_upper = NA
+    )
+
+    # print(best_model$fit)
+    # stop()
+    # print(typeof(best_model))
+    return(best_model)
+}
+
+.predict_xgboost <- function(obj, df) {
+    forecast_length <- nrow(df)
+    # print(obj$fit)
+    # print(dates)
+    # df <- .ts_to_df(obj$fit, obj$lags)
+    data <- obj$fit$yhat
+    xreg_data <- rbind(obj$xreg, df[, -1])
+    for (i in 1:forecast_length) {
+        n <- length(data)
+        # print(data)
+        step_data <- data[(n - obj$lags + 1):n] %>%
+            diff() %>%
+            rev() %>%
+            c(data[n], .)
+        if (!is.null(obj$xreg)) {
+            xreg_end <- nrow(xreg_data) - (forecast_length - i)
+            xreg_start <- xreg_end - obj$lag
+            step_xreg_data <- xreg_data[xreg_start:xreg_end, , drop = FALSE]
+            # print(step_xreg_data)
+            xreg_transformed <- step_xreg_data %>%
+                map(~ {
+                    original_diff <- diff(.x)
+                    second_value <- rev(.x)[2]
+                    rev_diff <- rev(original_diff)
+                    c(rev_diff[1], second_value, rev_diff[-1])
+                }) %>%
+                unlist()
+            step_data <- c(step_data, xreg_transformed)
+        }
+        # print(xreg_transformed)
+        # print(step_data)
+        # print(matrix(step_data, nrow=1))
+        # print(c(step_data, xreg_transformed))
+        # stop()
+        single_point_prediction <- predict(obj, matrix(step_data, nrow = 1))
+        # print(prediction)
+        data <- c(data, data[n] + single_point_prediction)
+        # print(data)
+    }
+    prediction <- data[(length(data) - forecast_length + 1):length(data)]
+    result <- data.frame(
+        ds = df[, 1],
+        yhat = prediction,
+        yhat_lower = NA,
+        yhat_upper = NA
+    )
+    # print(result)
+    # stop()
+    return(result)
+}
+
+model.fit <- function(df, prediction_method, transformation = NULL, ...) {
+    if (length(data) == 0) {
+        stop("Empty input data frame")
+    }
+    transform_params <- NULL
+    if (!is.null(transformation)) {
+        transform_params <- list()
+        for (column in names(df)[-1]) {
+            transformed_data <- transformation$transform(df[, column])
+            df[, column] <- transformed_data$data
+            transform_params[[length(transform_params) + 1]] <- transformed_data$params
+        }
+    }
+    # print(df)
+    # stop()
+    obj <- switch(prediction_method,
+        xgboost = {
+            .fit_xgboost(df, ...)
+        },
+        arima = {
+            .fit_arima(df, ...)
+        },
+        prophet = {
+            .fit_prophet(df, ...)
+        }
+    )
+    if (!is.null(transform_params)) {
+        obj$transformation <- transformation
+        obj$transform_params <- transform_params
+        for (column in names(obj$fit)[-1]) {
+            obj$fit[, column] <- obj$transformation$inverse(obj$fit[, column], obj$transform_params[[1]])
+        }
+    }
+    return(obj)
+}
+
+model.forecast <- function(obj, df, prediction_method) {
+    if (!is.null(obj$transformation)) {
+        for (column in names(df[, -1])) {
+            transformed_data <- obj$transformation$transform(df[, column], obj$transform_params[[column]])
+            df[, column] <- transformed_data$data
+        }
+    }
+    result <- switch(prediction_method,
+        xgboost = {
+            .predict_xgboost(obj, df)
+        },
+        arima = {
+            .predict_arima(obj, df)
+        },
+        prophet = {
+            .predict_prophet(obj, df)
+        }
+    )
+    if (is.null(result)) {
+        stop("Wrong prediction method")
+    }
+    if (!is.null(obj$transform_params)) {
+        for (column in names(result)[-1]) {
+            result[, column] <- obj$transformation$inverse(result[, column], obj$transform_params[[1]])
+        }
+    }
+    return(result)
+}
+```
+
+For the prediction we want dataframe of top/bottom keywords ranked by cross-correlation coefficient we calculated earlier,
+plus incidence/mortality counts. This way we get data frame with state, date, rate and top/bottom keywords columns. 
+
+```{r}
+shift_and_join <- function(trends, skyline, max_lags, file) {
+    max_lag <- max_lags %>%
+        filter(filename == file) %>%
+        pull(2)
+    shifted_skyline <- skyline %>%
+        mutate(ds = ds %m+% months(max_lag))
+    result <- trends %>%
+        filter(filename == file) %>%
+        filter(ds >= min(shifted_skyline$ds) & ds <= max(shifted_skyline$ds)) %>%
+        rename(trends = data) %>%
+        left_join(shifted_skyline %>% rename(skyline = data), by = "ds") %>%
+        relocate(skyline, .after = ds) %>%
+        select(c("ds", "skyline", "trends", "filename")) %>%
+        as.data.frame()
+    return(result)
+}
+
+trends_plus_skyline <- map_dfr(unique(trends_df$filename), function(cat) shift_and_join(trends_df, monthly_skyline_df, max_lags, cat))
+smoothed_trends_plus_skyline <- map_dfr(unique(smoothed_trends_df$filename), function(cat) shift_and_join(smoothed_trends_df, monthly_skyline_df, max_lags, cat))
+```
+
+Now we roll windows over each state's time series and issue predictions for each window.
+
+```{r}
+# This function applies other functions to each rolling window
+my_better_rollapply <- function(df, FUN, window, ...) {
+    result <- NULL
+    if (is.null(df)) {
+        stop("Data is NULL, nothing to predict.")
+    }
+    if (nrow(df) < window) {
+        stop(paste0("Window is wider than the data frame ", window, " vs ", nrow(df)))
+    }
+    for (start_idx in 1:(nrow(df) - window)) {
+        iteration_result <- FUN(df[start_idx:(start_idx + window - 1), ], ...)
+        if (is.null(result)) {
+            result <- data.frame(iteration_result)
+        } else {
+            result <- rbind(result, iteration_result)
+        }
+    }
+    return(result)
+}
+
+# This is prediction wrapper funnction. It prepears data for each window, fits and forecasts data.
+roll_fun <- function(df, horizon, method, transformation, filename) {
+    fit_and_predict <- function(fit_data, prediction_data, model_name, method, transformation, result = NULL) {
+        print(paste0("Running model ", model_name, " for ", tail(fit_data$ds, n = 1), " and ", filename))
+        prediction <- NULL
+        tryCatch(
+            {
+                m <- model.fit(
+                    fit_data,
+                    method,
+                    transformation = transformation
+                )
+                in_sample <- m$fit
+                in_sample$prediction_type <- "in-sample"
+                out_of_sample <- model.forecast(
+                    m,
+                    prediction_data,
+                    method
+                )
+                out_of_sample$prediction_type <- "out-of-sample"
+                # print(in_sample)
+                # print(out_of_sample)
+                prediction <- rbind(in_sample, out_of_sample)
+            },
+            error = function(e) {
+                print(paste0("Model ", model_name, " failed with error: ", e$message))
+            }
+        )
+        if (is.null(prediction)) {
+            prediction <- rbind(
+                data.frame(
+                    ds = fit_data$ds,
+                    yhat = NA,
+                    yhat_lower = NA,
+                    yhat_upper = NA,
+                    prediction_type = "in-sample"
+                ),
+                data.frame(
+                    ds = prediction_data$ds,
+                    yhat = NA,
+                    yhat_lower = NA,
+                    yhat_upper = NA,
+                    prediction_type = "out-of-sample"
+                )
+            )
+            # print(df)
+            # stop()
+        }
+        prediction$model <- model_name
+
+        if (is.null(result)) {
+            result <- prediction
+        } else {
+            result <- rbind(result, prediction)
+        }
+        return(result)
+    }
+
+    # print(df)
+    # stop()
+    in_sample_data <- df[1:(nrow(df) - horizon), ]
+    # This is data needed for forecast. It is dates plus external regressors
+    out_of_sample_data <- df[(nrow(df) - horizon + 1):nrow(df), -2]
+
+    result <- fit_and_predict(
+        in_sample_data,
+        out_of_sample_data,
+        paste0(method, "(", paste(names(df)[-1], collapse = ", "), ")"),
+        method,
+        transformation
+    )
+    result$fit_length <- nrow(in_sample_data)
+    result$horizon <- horizon
+    result$filename <- filename
+
+    return(result)
+}
+
+# This function makes minor preparations of data and then uses rolling window method to issue predictions
+prediction_pipe <- function(df, method, fit_lengths, horizons, transformation, selected_regressors = NULL) {
+    # We shift values by +1. This required for some models to converge.
+    shift_const <- 1
+    nested_data <- df %>%
+        select(c("ds", "filename", "skyline", selected_regressors)) %>%
+        group_by(filename) %>%
+        # mutate(across(-1, my_scale)) %>%
+        ungroup() %>%
+        mutate(across(-c(1, 2), ~ . + shift_const)) %>%
+        nest_by(filename) %>%
+        split(seq(nrow(.)))
+    # mutate(prediction = list(my_better_rollapply(
+    #     data,
+    #     roll_fun,
+    #     window = fit_length + horizon,
+    #     horizon = horizon,
+    #     method = method,
+    #     transformation = transformation,
+    #     state = cur_group()$state
+    # ))) %>%
+
+    if (cores == 1) {
+        lapply_fun <- lapply
+    } else {
+        lapply_fun <- mclapply
+    }
+    prediction <- NULL
+    for (horizon in horizons) {
+        for (fit_length in fit_lengths) {
+            tmp_prediction <- lapply_fun(
+                nested_data,
+                function(x, ...) {
+                    data <- x$data[[1]]
+                    if (rolling_window) {
+                        result <- my_better_rollapply(
+                            data,
+                            FUN = roll_fun,
+                            filename = x$filename,
+                            window = fit_length + horizon,
+                            horizon = horizon,
+                            method = method,
+                            transformation = transformation
+                        )
+                    } else {
+                        end <- fit_length + horizon
+                        start <- 1
+                        result <- roll_fun(
+                            data[start:end, ],
+                            filename = x$filename,
+                            horizon = horizon,
+                            method = method,
+                            transformation = transformation
+                        )
+                    }
+                    return(result)
+                },
+                mc.cores = cores
+            )
+            tmp_prediction <- do.call(rbind, tmp_prediction)
+            prediction <- rbind(prediction, tmp_prediction)
+        }
+    }
+
+    result <- prediction %>%
+        mutate(across(c("yhat", "yhat_lower", "yhat_upper"), ~ . - shift_const)) %>%
+        filter(prediction_type == "out-of-sample") %>%
+        as.data.frame()
+    return(result)
+}
+
+# This function runs forecast model with different sets of external regressors
+run_model <- function(df, method, fit_lengths, horizons, transformation) {
+    # Model without external regressors
+    result <- prediction_pipe(
+        df,
+        method,
+        fit_lengths,
+        horizons,
+        transformation
+    )
+
+    # Models with single external regressor
+    result <- rbind(
+        result,
+        prediction_pipe(
+            df,
+            method,
+            fit_lengths,
+            horizons,
+            transformation,
+            selected_regressors = c("trends")
+        )
+    )
+
+    return(result)
+}
+```
+
+Common file path declarations for the blocks below.
+
+```{r}
+arima_predictions_file <- paste0(output_dir, "/", hcv_prefix, "arima_predictions.RData")
+smoothed_arima_predictions_file <- paste0(output_dir, "/", hcv_prefix, "smoothed_arima_predictions.RData")
+
+prophet_predictions_file <- paste0(output_dir, "/", hcv_prefix, "prophet_predictions.RData")
+smoothed_prophet_predictions_file <- paste0(output_dir, "/", hcv_prefix, "smoothed_prophet_predictions.RData")
+
+xgboost_predictions_file <- paste0(output_dir, "/", hcv_prefix, "xgboost_predictions.RData")
+smoothed_xgboost_predictions_file <- paste0(output_dir, "/", hcv_prefix, "smoothed_xgboost_predictions.RData")
+```
+
+Here we run ARIMA predictive model and save predictions as files.
+
+```{r}
+arima_predictions <- run_model(
+    trends_plus_skyline,
+    "arima",
+    fit_lengths,
+    horizons,
+    NULL
+    # box_cox
+)
+
+smoothed_arima_predictions <- run_model(
+    smoothed_trends_plus_skyline,
+    "arima",
+    fit_lengths,
+    horizons,
+    NULL
+    # box_cox
+)
+
+save(arima_predictions, file = arima_predictions_file)
+save(smoothed_arima_predictions, file = smoothed_arima_predictions_file)
+```
+
+
+
+Here we run Prophet predictive model and save predictions as files.
+
+```{r}
+prophet_predictions <- run_model(
+    trends_plus_skyline,
+    "prophet",
+    fit_lengths,
+    horizons,
+    NULL
+)
+
+smoothed_prophet_predictions <- run_model(
+    smoothed_trends_plus_skyline,
+    "prophet",
+    fit_lengths,
+    horizons,
+    NULL
+)
+
+save(prophet_predictions, file = prophet_predictions_file)
+save(smoothed_prophet_predictions, file = smoothed_prophet_predictions_file)
+```
+
+XGBoost models run.
+
+```{r}
+xgboost_predictions <- run_model(
+    trends_plus_skyline,
+    "xgboost",
+    fit_lengths,
+    horizons,
+    NULL
+)
+
+smoothed_xgboost_predictions <- run_model(
+    smoothed_trends_plus_skyline,
+    "xgboost",
+    fit_lengths,
+    horizons,
+    NULL
+)
+
+save(xgboost_predictions, file = xgboost_predictions_file)
+save(smoothed_xgboost_predictions, file = smoothed_xgboost_predictions_file)
+```
+
+Load and combine all predictions in single table for each rate.
+
+```{r}
+load(file = arima_predictions_file)
+load(file = smoothed_arima_predictions_file)
+
+load(file = prophet_predictions_file)
+load(file = smoothed_prophet_predictions_file)
+
+load(file = xgboost_predictions_file)
+load(file = smoothed_xgboost_predictions_file)
+
+arima_predictions$model_family <- "arima"
+prophet_predictions$model_family <- "prophet"
+xgboost_predictions$model_family <- "xgboost"
+
+smoothed_arima_predictions$model_family <- "arima"
+smoothed_prophet_predictions$model_family <- "prophet"
+smoothed_xgboost_predictions$model_family <- "xgboost"
+
+predictions <- rbind(
+    arima_predictions,
+    prophet_predictions,
+    xgboost_predictions,
+    NULL
+)
+
+smoothed_predictions <- rbind(
+    smoothed_arima_predictions,
+    smoothed_prophet_predictions,
+    smoothed_xgboost_predictions,
+    NULL
+)
+```
+
+Now we want to calculate metrics for each model. We will use Mean Absolute Error and Root Mean Square Error.
+
+```{r}
+shift_and_join_predictions <- function(predictions, skyline, max_lags, file) {
+    max_lag <- max_lags %>%
+        filter(filename == file) %>%
+        pull(2)
+    shifted_skyline <- skyline %>%
+        mutate(ds = ds %m+% months(max_lag))
+    result <- predictions %>%
+        filter(filename == file) %>%
+        filter(ds >= min(shifted_skyline$ds) & ds <= max(shifted_skyline$ds)) %>%
+        left_join(shifted_skyline %>% rename(skyline = data), by = "ds") %>%
+        # relocate(skyline, .after = ds) %>%
+        filter(!is.na(yhat)) %>%
+        rename(data = "skyline") %>%
+        # select(c("ds", "skyline", "trends", "filename")) %>%
+        select(filename, ds, model, model_family, fit_length, horizon, data, yhat, yhat_lower, yhat_upper) %>%
+        as.data.frame()
+    return(result)
+}
+
+model_order <- unique(predictions$model)
+
+# Add real data to predictions
+predictions_and_data <- map_dfr(unique(trends_df$filename), function(file) shift_and_join_predictions(predictions, monthly_skyline_df, max_lags, file))
+smoothed_predictions_and_data <- map_dfr(unique(smoothed_trends_df$filename), function(file) shift_and_join_predictions(smoothed_predictions, monthly_skyline_df, max_lags, file))
+
+
+# Calculate metrics for each model and state
+raw_metrics <- predictions_and_data %>%
+    group_by(model, model_family, filename, fit_length, horizon) %>%
+    mutate(
+        abs_error = abs(data - yhat),
+        sqr_error = (data - yhat)^2,
+        in_prediction_interval = (data > yhat_lower & data < yhat_upper),
+        int_sc = interval_score(data, yhat_lower, yhat_upper, 90)
+    ) %>%
+    summarise(
+        MAE = mean(abs_error),
+        RMSE = sqrt(mean(sqr_error)),
+        WIS = mean(int_sc),
+        `95% PI Coverage` = mean(in_prediction_interval),
+        .groups = "drop"
+    ) %>%
+    pivot_longer(cols = c("MAE", "RMSE", "WIS", "95% PI Coverage"), names_to = "metric", values_to = "value") %>%
+    mutate(order_index = match(model, model_order)) %>%
+    arrange(order_index) %>%
+    select(-order_index) %>%
+    as.data.frame()
+
+smoothed_raw_metrics <- smoothed_predictions_and_data %>%
+    group_by(model, model_family, filename, fit_length, horizon) %>%
+    mutate(
+        abs_error = abs(data - yhat),
+        sqr_error = (data - yhat)^2,
+        in_prediction_interval = (data > yhat_lower & data < yhat_upper),
+        int_sc = interval_score(data, yhat_lower, yhat_upper, 90)
+    ) %>%
+    summarise(
+        MAE = mean(abs_error),
+        RMSE = sqrt(mean(sqr_error)),
+        WIS = mean(int_sc),
+        `95% PI Coverage` = mean(in_prediction_interval),
+        .groups = "drop"
+    ) %>%
+    pivot_longer(cols = c("MAE", "RMSE", "WIS", "95% PI Coverage"), names_to = "metric", values_to = "value") %>%
+    mutate(order_index = match(model, model_order)) %>%
+    arrange(order_index) %>%
+    select(-order_index) %>%
+    as.data.frame()
+
+# Summarize metrics across states for each model
+metrics <- raw_metrics
+smoothed_metrics <- smoothed_raw_metrics
+```
+
+```{r}
+arima_pred <- predictions_and_data %>%
+    filter(model_family == "arima" & filename == "opana_indiana")
+p <- ggplot() +
+    theme_classic(base_size = 12) +
+    labs(
+        # title = paste("Time Series for", file),
+        x = "Date",
+        y = "Value"
+    ) +
+    scale_x_continuous(breaks = seq(min(monthly_skyline_df$ds), max(monthly_skyline_df$ds), by = 10)) +
+    theme(
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(face = "bold"),
+        panel.border = element_rect(color = "black", fill = NA, size = 0.8)
+    ) +
+    geom_line(data = arima_pred, aes(x = ds, y = data, size = 0.1)) +
+    geom_point(
+        data = arima_pred %>% filter(model == "arima(skyline, trends)"),
+        aes(x = ds, y = yhat), size = 1, shape = 16, color = "blue"
+    ) +
+    geom_point(
+        data = arima_pred %>% filter(model == "arima(skyline)"),
+        aes(x = ds, y = yhat), size = 1, shape = 16, color = "red"
+    )
+ggsave(
+    filename = paste0(plot_dir, "/arima_prediction.pdf"),
+    plot = p,
+    width = 15,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+)
+
+prophet_pred <- predictions_and_data %>%
+    filter(model_family == "prophet" & filename == "opana_indiana")
+p <- ggplot() +
+    theme_classic(base_size = 12) +
+    labs(
+        # title = paste("Time Series for", file),
+        x = "Date",
+        y = "Value"
+    ) +
+    scale_x_continuous(breaks = seq(min(monthly_skyline_df$ds), max(monthly_skyline_df$ds), by = 10)) +
+    theme(
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(face = "bold"),
+        panel.border = element_rect(color = "black", fill = NA, size = 0.8)
+    ) +
+    geom_line(data = prophet_pred, aes(x = ds, y = data)) +
+    geom_point(
+        data = prophet_pred %>% filter(model == "prophet(skyline, trends)"),
+        aes(x = ds, y = yhat), size = 1, shape = 16, color = "blue"
+    ) +
+    geom_point(
+        data = prophet_pred %>% filter(model == "prophet(skyline)"),
+        aes(x = ds, y = yhat), size = 1, shape = 16, color = "red"
+    )
+ggsave(
+    filename = paste0(plot_dir, "/prophet_prediction.pdf"),
+    plot = p,
+    width = 15,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+)
+
+xgboost_pred <- predictions_and_data %>%
+    filter(model_family == "xgboost" & filename == "opana_indiana")
+p <- ggplot() +
+    theme_classic(base_size = 12) +
+    labs(
+        # title = paste("Time Series for", file),
+        x = "Date",
+        y = "Value"
+    ) +
+    scale_x_continuous(breaks = seq(min(monthly_skyline_df$ds), max(monthly_skyline_df$ds), by = 10)) +
+    theme(
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(face = "bold"),
+        panel.border = element_rect(color = "black", fill = NA, size = 0.8)
+    ) +
+    geom_line(data = xgboost_pred, aes(x = ds, y = data)) +
+    geom_point(
+        data = xgboost_pred %>% filter(model == "xgboost(skyline, trends)"),
+        aes(x = ds, y = yhat), size = 1, shape = 16, color = "blue"
+    ) +
+    geom_point(
+        data = xgboost_pred %>% filter(model == "xgboost(skyline)"),
+        aes(x = ds, y = yhat), size = 1, shape = 16, color = "red"
+    )
+ggsave(
+    filename = paste0(plot_dir, "/xgboost_prediction.pdf"),
+    plot = p,
+    width = 15,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+)
+```
+
+```{r}
+predictions_and_data %>%
+    group_by(model, model_family, filename, fit_length, horizon) %>%
+    mutate(
+        abs_error = abs(data - yhat),
+        sqr_error = (data - yhat)^2,
+        in_prediction_interval = (data > yhat_lower & data < yhat_upper),
+        int_sc = interval_score(data, yhat_lower, yhat_upper, 90)
+    ) %>%
+    filter(model_family == "arima" & filename == "opana_indiana") %>%
+    data.frame()
+```
+
+```{r}
+raw_metrics %>%
+    filter(model_family == "arima" & filename == "opana_indiana" & metric == "MAE") %>%
+    pivot_wider(values_from = "value", names_from = "model") %>%
+    data.frame() %>%
+    write.csv("raw_met.csv")
+```
+
+```{r}
+metrics %>%
+    select(model, model_family, metric, fit_length, horizon, value, filename) %>%
+    filter(metric %in% c("MAE")) %>%
+    group_by(model_family, metric, fit_length, horizon, filename) %>%
+    mutate(across(value, ~ (. - first(.)) / first(.) * 100)) %>%
+    dplyr::slice(-1) %>%
+    ungroup() %>%
+    filter(model_family == "arima" & filename == "opana_indiana") %>%
+    data.frame()
+# write.csv("rel_imp.csv")
+```
+
+Now we calculate summaries from performance tables.
+
+```{r}
+# Calculate how performance improved, compared to baseline model (first model we ran)
+relative_improvement <- metrics %>%
+    select(model, model_family, metric, fit_length, horizon, value, filename) %>%
+    filter(metric %in% c("MAE", "RMSE")) %>%
+    group_by(model_family, metric, fit_length, horizon, filename) %>%
+    mutate(across(value, ~ (. - first(.)) / first(.) * 100)) %>%
+    dplyr::slice(-1) %>%
+    ungroup() %>%
+    # select(-model_family) %>%
+    pivot_wider(
+        names_from = fit_length,
+        values_from = value
+    ) %>%
+    mutate(order_index = match(model, model_order)) %>%
+    arrange(order_index) %>%
+    select(-order_index) %>%
+    mutate(model = str_replace_all(model, "arima", "ARIMA")) %>%
+    mutate(model = str_replace_all(model, "prophet", "Prophet")) %>%
+    mutate(model = str_replace_all(model, "xgboost", "XGBoost")) %>%
+    mutate(
+        location = if_else(
+            str_ends(filename, "_indiana"),
+            "Indiana",
+            "Louisville, Kentucky"
+        )
+    ) %>%
+    mutate(
+        term = paste0(
+            if_else(
+                str_starts(filename, "opana_"),
+                "'opana' in ",
+                "'oxymorphone' in "
+            ),
+            location
+        )
+    ) %>%
+    relocate(term) %>%
+    arrange(metric, model_family, location) %>%
+    select(-location) %>%
+    as.data.frame()
+
+smoothed_relative_improvement <- smoothed_metrics %>%
+    select(model, model_family, metric, fit_length, horizon, value, filename) %>%
+    filter(metric %in% c("MAE", "RMSE")) %>%
+    group_by(model_family, metric, fit_length, horizon, filename) %>%
+    mutate(across(value, ~ (. - first(.)) / first(.) * 100)) %>%
+    dplyr::slice(-1) %>%
+    ungroup() %>%
+    # select(-model_family) %>%
+    pivot_wider(
+        names_from = fit_length,
+        values_from = value
+    ) %>%
+    mutate(order_index = match(model, model_order)) %>%
+    arrange(order_index) %>%
+    select(-order_index) %>%
+    mutate(model = str_replace_all(model, "arima", "ARIMA")) %>%
+    mutate(model = str_replace_all(model, "prophet", "Prophet")) %>%
+    mutate(model = str_replace_all(model, "xgboost", "XGBoost")) %>%
+    mutate(
+        location = if_else(
+            str_ends(filename, "_indiana"),
+            "Indiana",
+            "Louisville, Kentucky"
+        )
+    ) %>%
+    mutate(
+        term = paste0(
+            if_else(
+                str_starts(filename, "opana_"),
+                "'opana' in ",
+                "'oxymorphone' in "
+            ),
+            location
+        )
+    ) %>%
+    relocate(term) %>%
+    arrange(metric, model_family, location) %>%
+    select(-location) %>%
+    as.data.frame()
+```
+
+
+Those are summary files that produce statistics for each fit_length and put all of them in single table file (.tex and .csv).
+
+```{r}
+incidence_metrics_by_fit %>%
+    mutate_if(is.numeric, ~ round(., 2)) %>%
+    group_by(metric, horizon) %>%
+    group_split() %>%
+    walk(~ {
+        write_csv(select(.x, -metric, -horizon), paste0(
+            output_dir,
+            "/incidence_",
+            unique(.x$metric),
+            "_horizon_",
+            unique(.x$horizon),
+            ".csv"
+        ))
+
+        latex_table <- xtable(select(.x, -metric, -horizon))
+        print(latex_table,
+            file = paste0(
+                output_dir,
+                "/incidence_",
+                unique(.x$metric),
+                "_horizon_",
+                unique(.x$horizon),
+                ".tex"
+            ),
+            type = "latex",
+            include.rownames = FALSE
+        )
+    })
+
+mortality_metrics_by_fit %>%
+    mutate_if(is.numeric, ~ round(., 2)) %>%
+    group_by(metric, horizon) %>%
+    group_split() %>%
+    walk(~ {
+        write_csv(select(.x, -metric, -horizon), paste0(
+            output_dir,
+            "/mortality_",
+            unique(.x$metric),
+            "_horizon_",
+            unique(.x$horizon),
+            ".csv"
+        ))
+
+        latex_table <- xtable(select(.x, -metric, -horizon))
+        print(latex_table,
+            file = paste0(
+                output_dir,
+                "/mortality_",
+                unique(.x$metric),
+                "_horizon_",
+                unique(.x$horizon),
+                ".tex"
+            ),
+            type = "latex",
+            include.rownames = FALSE
+        )
+    })
+```
+
+Heatmaps for performance improvement by adding exogenous regressors.
+
+```{r}
+heatmap_palette <- c("#1065AB", "white", "#B31529")
+
+# One PDF per metric
+relative_improvement %>%
+    mutate_if(is.numeric, ~ round(., 2)) %>%
+    group_by(metric, horizon) %>%
+    group_split() %>%
+    walk(function(metric_df) {
+        metric_name <- unique(metric_df$metric)
+        horizon <- unique(metric_df$horizon)
+
+        # Collect plots as ggplot objects
+        plots <- metric_df %>%
+            group_by(horizon, model_family) %>%
+            group_split() %>%
+            map(~ {
+                model_family <- unique(.x$model_family)
+                horizon <- unique(.x$horizon)
+                df <- select(.x, -metric, -horizon, -model_family, -model, -filename)
+                df <- as.data.frame(df)
+
+                rownames(df) <- df[, 1]
+                df <- df[, -1]
+                color_range <- round(101 + max(df, na.rm = TRUE))
+                value_range <- c(-100, 100)
+                breaks <- c(
+                    seq(value_range[1], 0.0, length.out = floor(color_range / 2) + 1),
+                    seq(0, value_range[2], length.out = ceiling(color_range / 2) + 1)[-1]
+                )
+
+                # Create heatmap and wrap as ggplot object
+                p <- pheatmap(
+                    df,
+                    color = colorRampPalette(heatmap_palette)(color_range),
+                    breaks = breaks,
+                    fontsize_row = 14,
+                    fontsize_col = 14,
+                    cluster_rows = FALSE,
+                    cluster_cols = FALSE,
+                    display_numbers = TRUE,
+                    fontsize_number = 12,
+                    angle_col = 0,
+                    silent = TRUE,
+                    legend = FALSE,
+                    row_names_side = "left"
+                )
+
+                ggplotify::as.ggplot(p$gtable) + theme(plot.margin = margin(0, 0, 0, 25)) +
+                    ggtitle(paste0("Relative Improvement for ", improve_model_name(model_family), ", ", horizon, " Months Prediction")) +
+                    theme(plot.title = element_text(hjust = 0.5, size = 16))
+            })
+
+        # Combine all into one plot grid (single page) with labels
+        combined <- cowplot::plot_grid(
+            plotlist = plots,
+            ncol = 1,
+            labels = "AUTO",
+            label_size = 20,
+            rel_widths = c(0.5, 1)
+        )
+
+        # Save to one-page PDF per metric
+        ggsave(
+            filename = paste0(plot_dir, "/", hcv_prefix, "improvement_heatmap_", metric_name, "_horizon_", horizon, ".pdf"),
+            plot = combined,
+            width = 18,
+            height = ceiling(length(plots) / 2) * 5, # Adjust height per number of rows
+            dpi = 300,
+            bg = "white"
+        )
+    })
+
+smoothed_relative_improvement %>%
+    mutate_if(is.numeric, ~ round(., 2)) %>%
+    group_by(metric, horizon) %>%
+    group_split() %>%
+    walk(function(metric_df) {
+        metric_name <- unique(metric_df$metric)
+        horizon <- unique(metric_df$horizon)
+
+        # Collect plots as ggplot objects
+        plots <- metric_df %>%
+            group_by(horizon, model_family) %>%
+            group_split() %>%
+            map(~ {
+                model_family <- unique(.x$model_family)
+                horizon <- unique(.x$horizon)
+                df <- select(.x, -metric, -horizon, -model_family, -model, -filename)
+                df <- as.data.frame(df)
+
+                rownames(df) <- df[, 1]
+                df <- df[, -1]
+                color_range <- round(101 + max(df, na.rm = TRUE))
+                value_range <- c(-100, 100)
+                breaks <- c(
+                    seq(value_range[1], 0.0, length.out = floor(color_range / 2) + 1),
+                    seq(0, value_range[2], length.out = ceiling(color_range / 2) + 1)[-1]
+                )
+
+                # Create heatmap and wrap as ggplot object
+                p <- pheatmap(
+                    df,
+                    color = colorRampPalette(heatmap_palette)(color_range),
+                    breaks = breaks,
+                    fontsize_row = 14,
+                    fontsize_col = 14,
+                    cluster_rows = FALSE,
+                    cluster_cols = FALSE,
+                    display_numbers = TRUE,
+                    fontsize_number = 12,
+                    angle_col = 0,
+                    silent = TRUE,
+                    legend = FALSE,
+                    row_names_side = "left"
+                )
+
+                ggplotify::as.ggplot(p$gtable) + theme(plot.margin = margin(0, 0, 0, 25)) +
+                    ggtitle(paste0("Relative Improvement for ", improve_model_name(model_family), ", ", horizon, " Months Prediction")) +
+                    theme(plot.title = element_text(hjust = 0.5, size = 16))
+            })
+
+        # Combine all into one plot grid (single page) with labels
+        combined <- cowplot::plot_grid(
+            plotlist = plots,
+            ncol = 1,
+            labels = "AUTO",
+            label_size = 20,
+            rel_widths = c(0.5, 1)
+        )
+
+        # Save to one-page PDF per metric
+        ggsave(
+            filename = paste0(plot_dir, "/smoothed_", hcv_prefix, "improvement_heatmap_", metric_name, "_horizon_", horizon, ".pdf"),
+            plot = combined,
+            width = 18,
+            height = ceiling(length(plots) / 2) * 5, # Adjust height per number of rows
+            dpi = 300,
+            bg = "white"
+        )
+    })
+```

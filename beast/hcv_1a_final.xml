@@ -1,0 +1,401 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?><beast beautitemplate='Standard' beautistatus='' namespace="beast.core:beast.evolution.alignment:beast.evolution.tree.coalescent:beast.core.util:beast.evolution.nuc:beast.evolution.operators:beast.evolution.sitemodel:beast.evolution.substitutionmodel:beast.base.evolution.alignment:beast.pkgmgmt:beast.base.core:beast.base.inference:beast.base.evolution.tree.coalescent:beast.pkgmgmt:beast.base.core:beast.base.inference.util:beast.evolution.nuc:beast.base.evolution.operator:beast.base.inference.operator:beast.base.evolution.sitemodel:beast.base.evolution.substitutionmodel:beast.base.evolution.likelihood" required="BEAST.base v2.7.8" version="2.7">
+        
+
+
+    <map name="Uniform" >beast.base.inference.distribution.Uniform</map>
+
+    
+
+    <map name="Exponential" >beast.base.inference.distribution.Exponential</map>
+
+    
+
+    <map name="LogNormal" >beast.base.inference.distribution.LogNormalDistributionModel</map>
+
+    
+
+    <map name="Normal" >beast.base.inference.distribution.Normal</map>
+
+    
+
+    <map name="Beta" >beast.base.inference.distribution.Beta</map>
+
+    
+
+    <map name="Gamma" >beast.base.inference.distribution.Gamma</map>
+
+    
+
+    <map name="LaplaceDistribution" >beast.base.inference.distribution.LaplaceDistribution</map>
+
+    
+
+    <map name="prior" >beast.base.inference.distribution.Prior</map>
+
+    
+
+    <map name="InverseGamma" >beast.base.inference.distribution.InverseGamma</map>
+
+    
+
+    <map name="OneOnX" >beast.base.inference.distribution.OneOnX</map>
+
+    
+
+    <run id="mcmc" spec="MCMC" chainLength="300000000" numInitializationAttempts="100">
+            
+        <state id="state" spec="State" storeEvery="5000">
+                    
+            <tree id="Tree.t:hcv_1a" spec="beast.base.evolution.tree.Tree" name="stateNode">
+                            
+                <taxonset id="TaxonSet.hcv_1a" spec="TaxonSet">
+                                    
+                    <alignment idref="hcv_1a"/>
+                                
+                </taxonset>
+                        
+            </tree>
+                    
+            <parameter id="gammaShape.s:hcv_1a" spec="parameter.RealParameter" lower="0.1" name="stateNode">1.0</parameter>
+                    
+            <parameter id="rateAC.s:hcv_1a" spec="parameter.RealParameter" lower="0.0" name="stateNode">1.0</parameter>
+                    
+            <parameter id="rateAG.s:hcv_1a" spec="parameter.RealParameter" lower="0.0" name="stateNode">1.0</parameter>
+                    
+            <parameter id="rateAT.s:hcv_1a" spec="parameter.RealParameter" lower="0.0" name="stateNode">1.0</parameter>
+                    
+            <parameter id="rateCG.s:hcv_1a" spec="parameter.RealParameter" lower="0.0" name="stateNode">1.0</parameter>
+                    
+            <parameter id="rateGT.s:hcv_1a" spec="parameter.RealParameter" lower="0.0" name="stateNode">1.0</parameter>
+                    
+            <parameter id="freqParameter.s:hcv_1a" spec="parameter.RealParameter" dimension="4" lower="0.0" name="stateNode" upper="1.0">0.25</parameter>
+                    
+            <parameter id="bPopSizes.t:hcv_1a" spec="parameter.RealParameter" dimension="15" lower="0.0" name="stateNode">380.0</parameter>
+                    
+            <stateNode id="bGroupSizes.t:hcv_1a" spec="parameter.IntegerParameter" dimension="15">1</stateNode>
+                
+        </state>
+            
+        <init id="RandomTree.t:hcv_1a" spec="RandomTree" estimate="false" initial="@Tree.t:hcv_1a" taxa="@hcv_1a">
+                    
+            <populationModel id="ConstantPopulation0.t:hcv_1a" spec="ConstantPopulation">
+                            
+                <parameter id="randomPopSize.t:hcv_1a" spec="parameter.RealParameter" name="popSize">1.0</parameter>
+                        
+            </populationModel>
+                
+        </init>
+            
+        <distribution id="posterior" spec="CompoundDistribution">
+                    
+            <distribution id="prior" spec="CompoundDistribution">
+                            
+                <distribution id="BayesianSkyline.t:hcv_1a" spec="BayesianSkyline" groupSizes="@bGroupSizes.t:hcv_1a" popSizes="@bPopSizes.t:hcv_1a">
+                                    
+                    <treeIntervals id="BSPTreeIntervals.t:hcv_1a" spec="beast.base.evolution.tree.TreeIntervals" tree="@Tree.t:hcv_1a"/>
+                                
+                </distribution>
+                            
+                <distribution id="MarkovChainedPopSizes.t:hcv_1a" spec="distribution.MarkovChainDistribution" jeffreys="true" parameter="@bPopSizes.t:hcv_1a"/>
+                            
+                <prior id="FrequenciesPrior.s:hcv_1a" name="distribution" x="@freqParameter.s:hcv_1a">
+                                    
+                    <distr id="Dirichlet.0" spec="distribution.Dirichlet">
+                                            
+                        <parameter id="RealParameter.17" spec="parameter.RealParameter" dimension="4" estimate="false" name="alpha">4.0 4.0 4.0 4.0</parameter>
+                                        
+                    </distr>
+                                
+                </prior>
+                            
+                <prior id="GammaShapePrior.s:hcv_1a" name="distribution" x="@gammaShape.s:hcv_1a">
+                                    
+                    <Exponential id="Exponential.0" name="distr">
+                                            
+                        <parameter id="RealParameter.0" spec="parameter.RealParameter" estimate="false" name="mean">1.0</parameter>
+                                        
+                    </Exponential>
+                                
+                </prior>
+                            
+                <prior id="RateACPrior.s:hcv_1a" name="distribution" x="@rateAC.s:hcv_1a">
+                                    
+                    <Gamma id="Gamma.2" name="distr">
+                                            
+                        <parameter id="RealParameter.5" spec="parameter.RealParameter" estimate="false" name="alpha">0.05</parameter>
+                                            
+                        <parameter id="RealParameter.6" spec="parameter.RealParameter" estimate="false" name="beta">10.0</parameter>
+                                        
+                    </Gamma>
+                                
+                </prior>
+                            
+                <prior id="RateAGPrior.s:hcv_1a" name="distribution" x="@rateAG.s:hcv_1a">
+                                    
+                    <Gamma id="Gamma.3" name="distr">
+                                            
+                        <parameter id="RealParameter.7" spec="parameter.RealParameter" estimate="false" name="alpha">0.05</parameter>
+                                            
+                        <parameter id="RealParameter.8" spec="parameter.RealParameter" estimate="false" name="beta">20.0</parameter>
+                                        
+                    </Gamma>
+                                
+                </prior>
+                            
+                <prior id="RateATPrior.s:hcv_1a" name="distribution" x="@rateAT.s:hcv_1a">
+                                    
+                    <Gamma id="Gamma.4" name="distr">
+                                            
+                        <parameter id="RealParameter.9" spec="parameter.RealParameter" estimate="false" name="alpha">0.05</parameter>
+                                            
+                        <parameter id="RealParameter.10" spec="parameter.RealParameter" estimate="false" name="beta">10.0</parameter>
+                                        
+                    </Gamma>
+                                
+                </prior>
+                            
+                <prior id="RateCGPrior.s:hcv_1a" name="distribution" x="@rateCG.s:hcv_1a">
+                                    
+                    <Gamma id="Gamma.5" name="distr">
+                                            
+                        <parameter id="RealParameter.11" spec="parameter.RealParameter" estimate="false" name="alpha">0.05</parameter>
+                                            
+                        <parameter id="RealParameter.12" spec="parameter.RealParameter" estimate="false" name="beta">10.0</parameter>
+                                        
+                    </Gamma>
+                                
+                </prior>
+                            
+                <prior id="RateGTPrior.s:hcv_1a" name="distribution" x="@rateGT.s:hcv_1a">
+                                    
+                    <Gamma id="Gamma.7" name="distr">
+                                            
+                        <parameter id="RealParameter.15" spec="parameter.RealParameter" estimate="false" name="alpha">0.05</parameter>
+                                            
+                        <parameter id="RealParameter.16" spec="parameter.RealParameter" estimate="false" name="beta">10.0</parameter>
+                                        
+                    </Gamma>
+                                
+                </prior>
+                        
+            </distribution>
+                    
+            <distribution id="likelihood" spec="CompoundDistribution" useThreads="true">
+                            
+                <distribution id="treeLikelihood.hcv_1a" spec="ThreadedTreeLikelihood" data="@hcv_1a" tree="@Tree.t:hcv_1a">
+                                    
+                    <siteModel id="SiteModel.s:hcv_1a" spec="SiteModel" gammaCategoryCount="4" shape="@gammaShape.s:hcv_1a">
+                                            
+                        <parameter id="mutationRate.s:hcv_1a" spec="parameter.RealParameter" estimate="false" lower="0.0" name="mutationRate">1.0</parameter>
+                                            
+                        <parameter id="proportionInvariant.s:hcv_1a" spec="parameter.RealParameter" estimate="false" lower="0.0" name="proportionInvariant" upper="1.0">0.0</parameter>
+                                            
+                        <substModel id="gtr.s:hcv_1a" spec="GTR" rateAC="@rateAC.s:hcv_1a" rateAG="@rateAG.s:hcv_1a" rateAT="@rateAT.s:hcv_1a" rateCG="@rateCG.s:hcv_1a" rateGT="@rateGT.s:hcv_1a">
+                                                    
+                            <parameter id="rateCT.s:hcv_1a" spec="parameter.RealParameter" estimate="false" lower="0.0" name="rateCT">1.0</parameter>
+                                                    
+                            <frequencies id="estimatedFreqs.s:hcv_1a" spec="Frequencies" frequencies="@freqParameter.s:hcv_1a"/>
+                                                
+                        </substModel>
+                                        
+                    </siteModel>
+                                    
+                    <branchRateModel id="StrictClock.c:hcv_1a" spec="beast.base.evolution.branchratemodel.StrictClockModel">
+                                            
+                        <parameter id="clockRate.c:hcv_1a" spec="parameter.RealParameter" estimate="false" lower="0.0" name="clock.rate">0.005</parameter>
+                                        
+                    </branchRateModel>
+                                
+                </distribution>
+                        
+            </distribution>
+                
+        </distribution>
+            
+        <operator id="gammaShapeScaler.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.1">
+                    
+            <parameter idref="gammaShape.s:hcv_1a"/>
+                    
+            <operator id="AVMNOperator.hcv_1a" spec="kernel.AdaptableVarianceMultivariateNormalOperator" allowNonsense="true" beta="0.05" burnin="400" initial="800" weight="0.1">
+                            
+                <transformations id="AVMNSumTransform.hcv_1a" spec="operator.kernel.Transform$LogConstrainedSumTransform">
+                                    
+                    <f idref="freqParameter.s:hcv_1a"/>
+                                
+                </transformations>
+                            
+                <transformations id="AVMNLogTransform.hcv_1a" spec="operator.kernel.Transform$LogTransform">
+                                    
+                    <f idref="gammaShape.s:hcv_1a"/>
+                                    
+                    <f idref="rateAC.s:hcv_1a"/>
+                                    
+                    <f idref="rateAG.s:hcv_1a"/>
+                                    
+                    <f idref="rateAT.s:hcv_1a"/>
+                                    
+                    <f idref="rateCG.s:hcv_1a"/>
+                                    
+                    <f idref="rateGT.s:hcv_1a"/>
+                                
+                </transformations>
+                            
+                <transformations id="AVMNNoTransform.hcv_1a" spec="operator.kernel.Transform$NoTransform">
+                                    
+                    <f idref="Tree.t:hcv_1a"/>
+                                
+                </transformations>
+                        
+            </operator>
+                    
+            <operator id="gammaShapeScalerX.s:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@gammaShape.s:hcv_1a" scaleFactor="0.5" upper="10.0" weight="0.1"/>
+                
+        </operator>
+            
+        <operator id="RateACScaler.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.1">
+                    
+            <parameter idref="rateAC.s:hcv_1a"/>
+                    
+            <operator idref="AVMNOperator.hcv_1a"/>
+                    
+            <operator id="RateACScalerX.s:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@rateAC.s:hcv_1a" scaleFactor="0.5" upper="10.0" weight="0.1"/>
+                
+        </operator>
+            
+        <operator id="RateAGScaler.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.1">
+                    
+            <parameter idref="rateAG.s:hcv_1a"/>
+                    
+            <operator idref="AVMNOperator.hcv_1a"/>
+                    
+            <operator id="RateAGScalerX.s:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@rateAG.s:hcv_1a" scaleFactor="0.5" upper="10.0" weight="0.1"/>
+                
+        </operator>
+            
+        <operator id="RateATScaler.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.1">
+                    
+            <parameter idref="rateAT.s:hcv_1a"/>
+                    
+            <operator idref="AVMNOperator.hcv_1a"/>
+                    
+            <operator id="RateATScalerX.s:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@rateAT.s:hcv_1a" scaleFactor="0.5" upper="10.0" weight="0.1"/>
+                
+        </operator>
+            
+        <operator id="RateCGScaler.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.1">
+                    
+            <parameter idref="rateCG.s:hcv_1a"/>
+                    
+            <operator idref="AVMNOperator.hcv_1a"/>
+                    
+            <operator id="RateCGScalerX.s:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@rateCG.s:hcv_1a" scaleFactor="0.5" upper="10.0" weight="0.1"/>
+                
+        </operator>
+            
+        <operator id="RateGTScaler.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.1">
+                    
+            <parameter idref="rateGT.s:hcv_1a"/>
+                    
+            <operator idref="AVMNOperator.hcv_1a"/>
+                    
+            <operator id="RateGTScalerX.s:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@rateGT.s:hcv_1a" scaleFactor="0.5" upper="10.0" weight="0.1"/>
+                
+        </operator>
+            
+        <operator id="FrequenciesExchanger.s:hcv_1a" spec="AdaptableOperatorSampler" weight="0.5">
+                    
+            <parameter idref="freqParameter.s:hcv_1a"/>
+                    
+            <operator idref="AVMNOperator.hcv_1a"/>
+                    
+            <operator id="FrequenciesExchangerX.s:hcv_1a" spec="operator.kernel.BactrianDeltaExchangeOperator" delta="0.01" weight="0.1">
+                            
+                <parameter idref="freqParameter.s:hcv_1a"/>
+                        
+            </operator>
+                
+        </operator>
+            
+        <operator id="BayesianSkylineBICEPSEpochTop.t:hcv_1a" spec="EpochFlexOperator" scaleFactor="0.1" tree="@Tree.t:hcv_1a" weight="2.5"/>
+            
+        <operator id="BayesianSkylineBICEPSEpochAll.t:hcv_1a" spec="EpochFlexOperator" fromOldestTipOnly="false" scaleFactor="0.1" tree="@Tree.t:hcv_1a" weight="2.5"/>
+            
+        <operator id="BayesianSkylineBICEPSTreeFlex.t:hcv_1a" spec="TreeStretchOperator" scaleFactor="0.01" tree="@Tree.t:hcv_1a" weight="2.5"/>
+            
+        <operator id="BayesianSkylineTreeRootScaler.t:hcv_1a" spec="kernel.BactrianScaleOperator" rootOnly="true" scaleFactor="0.1" tree="@Tree.t:hcv_1a" upper="10.0" weight="3.5"/>
+            
+        <operator id="BayesianSkylineUniformOperator.t:hcv_1a" spec="kernel.BactrianNodeOperator" tree="@Tree.t:hcv_1a" weight="35.0"/>
+            
+        <operator id="BayesianSkylineSubtreeSlide.t:hcv_1a" spec="kernel.BactrianSubtreeSlide" tree="@Tree.t:hcv_1a" weight="20.0"/>
+            
+        <operator id="BayesianSkylineNarrow.t:hcv_1a" spec="Exchange" tree="@Tree.t:hcv_1a" weight="20.0"/>
+            
+        <operator id="BayesianSkylineWide.t:hcv_1a" spec="Exchange" isNarrow="false" tree="@Tree.t:hcv_1a" weight="3.5"/>
+            
+        <operator id="BayesianSkylineWilsonBalding.t:hcv_1a" spec="WilsonBalding" tree="@Tree.t:hcv_1a" weight="3.5"/>
+            
+        <operator id="popSizesScaler.t:hcv_1a" spec="kernel.BactrianScaleOperator" parameter="@bPopSizes.t:hcv_1a" upper="10.0" weight="20.0"/>
+            
+        <operator id="groupSizesDelta.t:hcv_1a" spec="operator.kernel.BactrianDeltaExchangeOperator" integer="true" weight="8.0">
+                    
+            <intparameter idref="bGroupSizes.t:hcv_1a"/>
+                
+        </operator>
+            
+        <logger id="tracelog" spec="Logger" fileName="$(filebase).log" logEvery="30000" model="@posterior" sanitiseHeaders="true" sort="smart">
+                    
+            <log idref="posterior"/>
+                    
+            <log idref="likelihood"/>
+                    
+            <log idref="prior"/>
+                    
+            <log idref="treeLikelihood.hcv_1a"/>
+                    
+            <log id="TreeHeight.t:hcv_1a" spec="beast.base.evolution.tree.TreeStatLogger" tree="@Tree.t:hcv_1a"/>
+                    
+            <log idref="gammaShape.s:hcv_1a"/>
+                    
+            <log idref="rateAC.s:hcv_1a"/>
+                    
+            <log idref="rateAG.s:hcv_1a"/>
+                    
+            <log idref="rateAT.s:hcv_1a"/>
+                    
+            <log idref="rateCG.s:hcv_1a"/>
+                    
+            <log idref="rateGT.s:hcv_1a"/>
+                    
+            <log idref="freqParameter.s:hcv_1a"/>
+                    
+            <log idref="BayesianSkyline.t:hcv_1a"/>
+                    
+            <log idref="bPopSizes.t:hcv_1a"/>
+                    
+            <log idref="bGroupSizes.t:hcv_1a"/>
+                
+        </logger>
+            
+        <logger id="screenlog" spec="Logger" logEvery="1000">
+                    
+            <log idref="posterior"/>
+                    
+            <log idref="likelihood"/>
+                    
+            <log idref="prior"/>
+                
+        </logger>
+            
+        <logger id="treelog.t:hcv_1a" spec="Logger" fileName="$(filebase)-$(tree).trees" logEvery="30000" mode="tree">
+                    
+            <log id="TreeWithMetaDataLogger.t:hcv_1a" spec="beast.base.evolution.TreeWithMetaDataLogger" tree="@Tree.t:hcv_1a"/>
+                
+        </logger>
+            
+        <operatorschedule id="OperatorSchedule" spec="OperatorSchedule"/>
+        
+    </run>
+
+    
+
+</beast>
