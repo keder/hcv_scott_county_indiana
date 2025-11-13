@@ -31,6 +31,9 @@ library("knitr")
 library("cowplot")
 library("gridExtra")
 library("ggplotify")
+library("tensorflow")
+library("keras3")
+library("torch")
 ```
 
 Here we initialize all variables that are common for all other sections.
@@ -75,9 +78,9 @@ prediction_plots <- TRUE
 # You can select transformation of data before fit and after fit/prediction. Values: "boxcox" and "disabled".
 # For prophet it is strongly recommended to disable transformation.
 
-# hcv_type <- "1a"
+hcv_type <- "1a"
 # hcv_type <- "3a"
-hcv_type <- "combined"
+# hcv_type <- "combined"
 hcv_prefix <- paste0(hcv_type, "_")
 
 set.seed(1234)
@@ -107,9 +110,10 @@ my_scale <- function(data) {
     # return(((data - mu) / sigma + 3) * 100 / 6)
 }
 
-create_lagged_features <- function(df, lags) {
+create_lagged_features <- function(df, lags, diff = TRUE) {
     result <- NULL
     df <- as.data.frame(df)
+    # print(df)
 
     for (i in 2:ncol(df)) {
         col_values <- as.vector(df[, i])
@@ -117,22 +121,29 @@ create_lagged_features <- function(df, lags) {
         # col_name <- names(df)[i]
 
         lagged <- embed(col_values, curr_lag + 1)
-        # print(lagged)
-        diff_features <- apply(lagged[, -1], 1, function(x) rev(diff(rev(x))))
-        if (is.matrix(diff_features)) {
-            diff_features <- t(diff_features)
+        if (diff) {
+            diff_features <- apply(lagged[, -1], 1, function(x) rev(diff(rev(x))))
+            if (is.matrix(diff_features)) {
+                diff_features <- t(diff_features)
+            } else {
+                diff_features <- as.matrix(diff_features)
+            }
+            future_growth <- as.matrix(apply(lagged[, c(1, 2)], 1, function(x) rev(diff(rev(x)))))
+            # print(result)
+            # print(future_growth)
+            # print(lagged[, 2])
+            # print(diff_features)
+            if (is.null(result)) {
+                result <- cbind(future_growth, lagged[, 2], diff_features)
+            } else {
+                result <- cbind(result, future_growth, lagged[, 2], diff_features)
+            }
         } else {
-            diff_features <- as.matrix(diff_features)
-        }
-        future_growth <- as.matrix(apply(lagged[, c(1, 2)], 1, function(x) rev(diff(rev(x)))))
-        # print(result)
-        # print(future_growth)
-        # print(lagged[, 2])
-        # print(diff_features)
-        if (is.null(result)) {
-            result <- cbind(future_growth, lagged[, 2], diff_features)
-        } else {
-            result <- cbind(result, future_growth, lagged[, 2], diff_features)
+            if (is.null(result)) {
+                result <- as.matrix(lagged)
+            } else {
+                result <- cbind(result, as.matrix(lagged))
+            }
         }
         # print(result)
         # stop()
@@ -151,7 +162,8 @@ improve_model_name <- function(model_name) {
     model_names <- c(
         "arima" = "ARIMA",
         "prophet" = "Prophet",
-        "xgboost" = "XGBoost"
+        "xgboost" = "XGBoost",
+        "lstm" = "LSTM"
     )
     return(model_names[model_name])
 }
@@ -545,6 +557,26 @@ box_cox$inverse <- function(input_data, params) {
     result <- InvBoxCox(x = input_data, lambda = params$lambda) - 1
     return(result)
 }
+zs_norm <- list()
+zs_norm$transform <- function(input_data, params = NULL, ...) {
+    sd_threshold <- 0.01
+    if (is.null(params)) {
+        params <- list()
+        params$mean <- mean(input_data)
+        params$sd <- sd(input_data)
+    }
+    if (params$sd > sd_threshold) {
+        result <- list(data = (input_data - params$mean) / params$sd, params = params)
+    } else {
+        result <- list(data = input_data - params$mean, params = params)
+    }
+    return(result)
+}
+
+zs_norm$inverse <- function(input_data, params) {
+    result <- input_data * params$sd + params$mean
+    return(result)
+}
 ```
 
 Here we use adapter design pattern to make forecast model interfaces more uniform. 
@@ -714,10 +746,11 @@ rest are external regressors.
     # print(c(df[1:(best_model$lags - 1), 2], train_data[, 1] + fit_pred))
     best_model$fit <- data.frame(
         ds = df$ds,
-        yhat = c(df[1:best_model$lags, 2], train_data[, 1] + fit_pred),
-        yhat_lower = NA,
-        yhat_upper = NA
+        yhat = c(df[1:best_model$lags, 2], train_data[, 1] + fit_pred)
     )
+    obj$fit$yhat_lower <- NA_real_
+    obj$fit$yhat_upper <- NA_real_
+    obj$fit_internal <- data.frame(obj$fit)
 
     # print(best_model$fit)
     # stop()
@@ -730,7 +763,7 @@ rest are external regressors.
     # print(obj$fit)
     # print(dates)
     # df <- .ts_to_df(obj$fit, obj$lags)
-    data <- obj$fit$yhat
+    data <- obj$fit_internal$yhat
     xreg_data <- rbind(obj$xreg, df[, -1])
     for (i in 1:forecast_length) {
         n <- length(data)
@@ -741,7 +774,7 @@ rest are external regressors.
             c(data[n], .)
         if (!is.null(obj$xreg)) {
             xreg_end <- nrow(xreg_data) - (forecast_length - i)
-            xreg_start <- xreg_end - obj$lag
+            xreg_start <- xreg_end - obj$lags
             step_xreg_data <- xreg_data[xreg_start:xreg_end, , drop = FALSE]
             # print(step_xreg_data)
             xreg_transformed <- step_xreg_data %>%
@@ -767,13 +800,305 @@ rest are external regressors.
     prediction <- data[(length(data) - forecast_length + 1):length(data)]
     result <- data.frame(
         ds = df[, 1],
-        yhat = prediction,
-        yhat_lower = NA,
-        yhat_upper = NA
+        yhat = prediction
     )
+    result$yhat_lower <- NA_real_
+    result$yhat_upper <- NA_real_
     # print(result)
     # stop()
     return(result)
+}
+
+# .fit_lstm <- function(df, lags = 5, ...) {
+#     df <- as.data.frame(df)
+#     names(df)[1] <- "ds"
+#     names(df)[2] <- "y"
+#     n_samples <- nrow(df) - lags
+#     n_features <- ncol(df) - 1
+#     # print(df)
+
+#     X <- array(0, dim = c(n_samples, lags, n_features))
+#     y <- numeric(n_samples)
+#     for (i in 1:n_samples) {
+#         X[i, , ] <- as.matrix(df[i:(i + lags - 1), -1])
+#         y[i] <- df$y[i + lags]
+#     }
+#     # print(X)
+#     # print(y)
+#     # lagged_features <- create_lagged_features(df, rep(lags, ncol(df) - 1), FALSE)
+#     # print(lagged_features)
+#     # stop()
+
+#     # train_data <- lagged_features[, -1]
+#     # train_labels <- lagged_features[, 1]
+#     # print(train_labels)
+
+#     obj <- keras_model_sequential() %>%
+#         # layer_input(shape = c(lags, n_features)) %>%
+#         layer_lstm(units = 25, input_shape = c(lags, n_features), return_sequences = TRUE) %>%
+#         layer_dropout(rate = 0.1) %>%
+#         layer_lstm(units = 25, return_sequences = FALSE) %>%
+#         layer_dropout(rate = 0.1) %>%
+#         layer_dense(units = 1)
+
+#     obj %>% compile(
+#         optimizer = "adam",
+#         loss = "mse", # mean squared error
+#         metrics = list("mae")
+#     )
+
+#     obj %>% fit(
+#         X, y,
+#         epochs = 20,
+#         batch_size = 1,
+#         shuffle = FALSE,
+#         verbose = 0
+#     )
+#     obj$lags <- lags
+#     if (ncol(df) > 2) {
+#         obj$xreg <- df[, -c(1, 2), drop = FALSE]
+#     } else {
+#         obj$xreg <- NULL
+#     }
+
+
+#     fit_pred <- predict(obj, X)
+#     obj$fit <- data.frame(
+#         ds = df$ds,
+#         yhat = c(df[1:obj$lags, 2], fit_pred)
+#     )
+#     obj$fit$yhat_lower <- NA_real_
+#     obj$fit$yhat_upper <- NA_real_
+#     obj$fit_internal <- data.frame(obj$fit)
+
+#     # print(obj$fit)
+#     # print(obj)
+#     # stop()
+#     return(obj)
+# }
+
+# .predict_lstm <- function(obj, df) {
+#     forecast_length <- nrow(df)
+#     # print(obj$fit)
+#     # print(dates)
+#     # df <- .ts_to_df(obj$fit, obj$lags)
+#     data <- obj$fit_internal$yhat
+#     xreg_data <- rbind(obj$xreg, df[, -1])
+#     # print(data)
+#     # print(xreg_data)
+#     for (i in 1:forecast_length) {
+#         n <- length(data)
+#         # print(data)
+#         step_data <- data.frame(y = data[(n - obj$lags + 1):n])
+#         # print(step_data)
+#         if (!is.null(obj$xreg)) {
+#             xreg_end <- nrow(xreg_data) - (forecast_length - i)
+#             xreg_start <- xreg_end - obj$lags + 1
+#             step_xreg_data <- xreg_data[xreg_start:xreg_end, , drop = FALSE]
+#             # print(step_xreg_data)
+#             step_data <- cbind(step_data, step_xreg_data)
+#             # print(step_data)
+#         }
+#         # print(xreg_transformed)
+#         # print(matrix(step_data, nrow=1))
+#         # print(c(step_data, xreg_transformed))
+#         n_samples <- 1
+#         n_features <- ncol(step_data)
+#         X <- array(0, dim = c(n_samples, obj$lags, n_features))
+#         for (i in 1:n_samples) {
+#             X[i, , ] <- as.matrix(step_data[i:(i + obj$lags - 1), ])
+#         }
+#         # print(X)
+#         single_point_prediction <- predict(obj, X)
+#         data <- c(data, single_point_prediction)
+#         # print(data)
+#     }
+#     prediction <- data[(length(data) - forecast_length + 1):length(data)]
+#     # print(prediction)
+#     result <- data.frame(
+#         ds = df[, 1],
+#         yhat = prediction
+#     )
+#     result$yhat_lower <- NA_real_
+#     result$yhat_upper <- NA_real_
+#     # print(result)
+
+#     return(result)
+# }
+
+# .destroy_lstm <- function(obj) {
+#     keras3::clear_session()
+#     gc()
+# }
+
+.fit_lstm <- function(df, lags = 5, hidden_size = 10, learningrate = 0.01, epochs = 20) {
+  y_col <- 2
+  xreg_cols <- if (ncol(df) > 2) 3:ncol(df) else NULL
+  
+  # Combine main + xregs
+  data_mat <- as.matrix(df[, c(y_col, xreg_cols), drop = FALSE])
+  n_features <- ncol(data_mat)
+  n_rows <- nrow(data_mat)
+  
+  if (n_rows <= lags) stop("Not enough rows for the specified lags")
+  
+  # Prepare X and Y
+  n_samples <- n_rows - lags
+  X_array <- array(NA_real_, dim = c(n_samples, lags, n_features))
+  Y_array <- array(NA_real_, dim = c(n_samples, 1, 1))
+  
+  for (i in seq_len(n_samples)) {
+    # lagged window for X
+    X_array[i,,] <- data_mat[i:(i + lags - 1), , drop = FALSE]
+    # label is the next value of main regressor
+    Y_array[i, 1, 1] <- data_mat[i + lags, 1]
+  }
+#   print(df)
+#   print(X_array)
+#   print(Y_array)
+  
+  # Train LSTM
+  model <- rnn::trainr(
+    X = X_array,
+    Y = Y_array,
+    learningrate = learningrate,
+    hidden_dim = hidden_size,
+    numepochs = epochs,
+    network_type = "lstm",
+    seq_to_seq_unsync = TRUE
+  )
+  
+  # Store results
+  obj <- list()
+  # fit_internal: we store predicted values on the training set
+  train_pred <- rnn::predictr(model, X_array)
+  obj$fit <- data.frame(
+    ds = df$ds[(lags + 1):n_rows],
+    yhat = as.numeric(train_pred)
+  )
+  obj$fit$yhat_lower <- NA_real_
+  obj$fit$yhat_upper <- NA_real_
+  obj$fit_internal <- data.frame(obj$fit)
+  
+  obj$xreg <- if (!is.null(xreg_cols)) df[(lags + 1):n_rows, xreg_cols, drop = FALSE] else NULL
+  obj$lags <- lags
+  obj$n_features <- n_features
+  obj$model <- model
+  
+  return(obj)
+}
+
+
+.predict_lstm <- function(obj, df) {
+  # df: prediction-period data, format: 1st col ds, remaining cols = xregs for future horizon
+  if (!is.list(obj) || is.null(obj$fit_internal) || is.null(obj$lags) || is.null(obj$model)) {
+    stop("obj must be created by .fit_lstm and contain fit_internal, lags and model")
+  }
+  lags <- as.integer(obj$lags)
+  if (is.null(lags) || lags < 1) stop("obj$lags invalid")
+
+  # future xregs
+  if (!("data.frame" %in% class(df) || "tbl_df" %in% class(df))) {
+    stop("df must be a data.frame or tibble")
+  }
+  h <- nrow(df)
+  if (h < 1) stop("prediction df must have at least one row (horizon)")
+
+  # xreg columns expected names should match obj$xreg names (if any)
+  xreg_names <- if (!is.null(obj$xreg)) names(obj$xreg) else character(0)
+  if (length(xreg_names) > 0) {
+    missing_cols <- setdiff(xreg_names, names(df))
+    if (length(missing_cols) > 0) stop("Prediction df does not have all required xreg columns")
+    future_xreg <- as.matrix(df[, xreg_names, drop = FALSE])
+  } else {
+    future_xreg <- NULL
+  }
+
+  # prepare history of main regressor (yhat) and xregs
+  hist_main <- as.numeric(obj$fit_internal$yhat) # length n_fit
+  n_hist <- length(hist_main)
+  hist_xreg <- if (!is.null(obj$xreg)) as.matrix(obj$xreg) else matrix(nrow = n_hist, ncol = 0)
+
+  # We'll iteratively forecast h steps. Each iteration:
+  # - build a window of length `lags` of features (main + xregs)
+  # - call rnn::predictr on that single-sample window and take last timestep output
+  preds <- numeric(h)
+  for (t in seq_len(h)) {
+    # Build arrays for the current input window:
+    # For main: take last `lags` values from (hist_main + preds already created)
+    main_history <- c(hist_main, preds[seq_len(t - 1)])
+    main_window <- tail(main_history, lags)
+
+    # For xregs: need window of length lags for each regressor.
+    # For positions that fall into historical part: use hist_xreg
+    # For positions that fall into future part: take from future_xreg rows 1..(t-1) as they become available
+    if (length(xreg_names) > 0) {
+      # build full_xreg_seq: rows = historical xreg rows followed by future xreg rows
+      full_xreg_seq <- rbind(hist_xreg, future_xreg)
+      # we need last `lags` rows that correspond to the appropriate timeline:
+      # the offset to pick depends on how many future steps we've already predicted (t-1)
+      # current prediction corresponds to time = n_hist + t
+      # window should cover times (n_hist + t - lags) .. (n_hist + t - 1)
+      end_idx <- n_hist + t - 1
+      start_idx <- end_idx - lags + 1
+      if (start_idx < 1) {
+        # if we don't have enough rows in full_xreg_seq (shouldn't happen if history covers at least lags),
+        # pad with the earliest available row repeated
+        pad_needed <- 1 - start_idx
+        pad_mat <- matrix(rep(full_xreg_seq[1, , drop = FALSE], pad_needed), nrow = pad_needed, byrow = TRUE)
+        want_rows <- rbind(pad_mat, full_xreg_seq[1:end_idx, , drop = FALSE])
+      } else {
+        want_rows <- full_xreg_seq[start_idx:end_idx, , drop = FALSE]
+      }
+      xreg_window <- want_rows # lags x n_xreg
+    } else {
+      xreg_window <- matrix(nrow = lags, ncol = 0)
+    }
+
+    # Compose feature window: columns order must match training: main first, then xregs
+    if (ncol(xreg_window) > 0) {
+      feature_window <- cbind(matrix(main_window, ncol = 1), as.matrix(xreg_window))
+    } else {
+      feature_window <- matrix(main_window, ncol = 1)
+    }
+
+    # Build X_array for predictr: samples x time x features  (1 x lags x n_features)
+    X_array <- array(feature_window, dim = c(1, lags, ncol(feature_window)))
+
+    # Predict
+    pred_raw <- rnn::predictr(obj$model, X_array)
+    pv <- as.numeric(pred_raw)
+    # try to interpret output: prefer last timestep value
+    if (length(pv) == lags) {
+      pred_value <- pv[length(pv)]
+    } else if (length(pv) == 1) {
+      pred_value <- pv
+    } else if (length(pv) == lags * 1) {
+      # shape samples x time -> here samples=1
+      pred_mat <- matrix(pv, nrow = 1, ncol = lags, byrow = TRUE)
+      pred_value <- pred_mat[1, ncol(pred_mat)]
+    } else {
+      # fallback: take last element
+      pred_value <- pv[length(pv)]
+    }
+
+    preds[t] <- pred_value
+    # continue loop; next iteration will use preds[1:t] in forming main_history
+  }
+
+  # build forecast df in same simple format as obj$fit (ds, yhat)
+  res <- data.frame(
+    ds = df[[1]],
+    yhat = as.numeric(preds)
+  )
+  res$yhat_lower <- NA_real_
+  res$yhat_upper <- NA_real_
+
+  return(res)
+}
+
+.destroy_lstm <- function(obj) {
+    gc()
 }
 
 model.fit <- function(df, prediction_method, transformation = NULL, ...) {
@@ -783,10 +1108,12 @@ model.fit <- function(df, prediction_method, transformation = NULL, ...) {
     transform_params <- NULL
     if (!is.null(transformation)) {
         transform_params <- list()
-        for (column in names(df)[-1]) {
-            transformed_data <- transformation$transform(df[, column])
+        columns <- names(df)[-1]
+        for (i in 1:length(columns)) {
+            column <- columns[i]
+            transformed_data <- transformation$transform(unlist(df[, column]))
             df[, column] <- transformed_data$data
-            transform_params[[length(transform_params) + 1]] <- transformed_data$params
+            transform_params[[i]] <- transformed_data$params
         }
     }
     # print(df)
@@ -794,6 +1121,9 @@ model.fit <- function(df, prediction_method, transformation = NULL, ...) {
     obj <- switch(prediction_method,
         xgboost = {
             .fit_xgboost(df, ...)
+        },
+        lstm = {
+            .fit_lstm(df, ...)
         },
         arima = {
             .fit_arima(df, ...)
@@ -806,22 +1136,27 @@ model.fit <- function(df, prediction_method, transformation = NULL, ...) {
         obj$transformation <- transformation
         obj$transform_params <- transform_params
         for (column in names(obj$fit)[-1]) {
-            obj$fit[, column] <- obj$transformation$inverse(obj$fit[, column], obj$transform_params[[1]])
+            obj$fit[, column] <- obj$transformation$inverse(unlist(obj$fit[, column]), obj$transform_params[[1]])
         }
     }
     return(obj)
 }
 
 model.forecast <- function(obj, df, prediction_method) {
-    if (!is.null(obj$transformation)) {
-        for (column in names(df[, -1])) {
-            transformed_data <- obj$transformation$transform(df[, column], obj$transform_params[[column]])
+    if (!is.null(obj$transformation) && (ncol(df) > 1)) {
+        columns <- names(df)[-1]
+        for (i in 1:length(columns)) {
+            column <- columns[i]
+            transformed_data <- obj$transformation$transform(unlist(df[, column]), obj$transform_params[[i + 1]])
             df[, column] <- transformed_data$data
         }
     }
     result <- switch(prediction_method,
         xgboost = {
             .predict_xgboost(obj, df)
+        },
+        lstm = {
+            .predict_lstm(obj, df)
         },
         arima = {
             .predict_arima(obj, df)
@@ -835,10 +1170,27 @@ model.forecast <- function(obj, df, prediction_method) {
     }
     if (!is.null(obj$transform_params)) {
         for (column in names(result)[-1]) {
-            result[, column] <- obj$transformation$inverse(result[, column], obj$transform_params[[1]])
+            result[, column] <- obj$transformation$inverse(unlist(result[, column]), obj$transform_params[[1]])
         }
     }
     return(result)
+}
+
+model.destroy <- function(obj, prediction_method) {
+    switch(prediction_method,
+        xgboost = {
+            return()
+        },
+        lstm = {
+            .destroy_lstm(obj)
+        },
+        arima = {
+            return()
+        },
+        prophet = {
+            return()
+        }
+    )
 }
 ```
 
@@ -909,9 +1261,11 @@ roll_fun <- function(df, horizon, method, transformation, filename) {
                     prediction_data,
                     method
                 )
+                model.destroy(m, method)
                 out_of_sample$prediction_type <- "out-of-sample"
                 # print(in_sample)
                 # print(out_of_sample)
+                # stop()
                 prediction <- rbind(in_sample, out_of_sample)
             },
             error = function(e) {
@@ -1036,6 +1390,8 @@ prediction_pipe <- function(df, method, fit_lengths, horizons, transformation, s
         mutate(across(c("yhat", "yhat_lower", "yhat_upper"), ~ . - shift_const)) %>%
         filter(prediction_type == "out-of-sample") %>%
         as.data.frame()
+    # Let's call garbage collector, just in case
+    gc()
     return(result)
 }
 
@@ -1062,6 +1418,14 @@ run_model <- function(df, method, fit_lengths, horizons, transformation) {
             selected_regressors = c("trends")
         )
     )
+    # result <- prediction_pipe(
+    #     df,
+    #     method,
+    #     fit_lengths,
+    #     horizons,
+    #     transformation,
+    #     selected_regressors = c("trends")
+    # )
 
     return(result)
 }
@@ -1078,6 +1442,9 @@ smoothed_prophet_predictions_file <- paste0(output_dir, "/", hcv_prefix, "smooth
 
 xgboost_predictions_file <- paste0(output_dir, "/", hcv_prefix, "xgboost_predictions.RData")
 smoothed_xgboost_predictions_file <- paste0(output_dir, "/", hcv_prefix, "smoothed_xgboost_predictions.RData")
+
+lstm_predictions_file <- paste0(output_dir, "/", hcv_prefix, "lstm_predictions.RData")
+smoothed_lstm_predictions_file <- paste0(output_dir, "/", hcv_prefix, "lstm_xgboost_predictions.RData")
 ```
 
 Here we run ARIMA predictive model and save predictions as files.
@@ -1153,6 +1520,29 @@ save(xgboost_predictions, file = xgboost_predictions_file)
 save(smoothed_xgboost_predictions, file = smoothed_xgboost_predictions_file)
 ```
 
+LSTMs run.
+
+```{r}
+lstm_predictions <- run_model(
+    trends_plus_skyline,
+    "lstm",
+    fit_lengths,
+    horizons,
+    zs_norm
+)
+
+smoothed_lstm_predictions <- run_model(
+    smoothed_trends_plus_skyline,
+    "lstm",
+    fit_lengths,
+    horizons,
+    zs_norm
+)
+
+save(lstm_predictions, file = lstm_predictions_file)
+save(smoothed_lstm_predictions, file = smoothed_lstm_predictions_file)
+```
+
 Load and combine all predictions in single table for each rate.
 
 ```{r}
@@ -1165,18 +1555,24 @@ load(file = smoothed_prophet_predictions_file)
 load(file = xgboost_predictions_file)
 load(file = smoothed_xgboost_predictions_file)
 
+load(file = lstm_predictions_file)
+load(file = smoothed_lstm_predictions_file)
+
 arima_predictions$model_family <- "arima"
 prophet_predictions$model_family <- "prophet"
 xgboost_predictions$model_family <- "xgboost"
+lstm_predictions$model_family <- "lstm"
 
 smoothed_arima_predictions$model_family <- "arima"
 smoothed_prophet_predictions$model_family <- "prophet"
 smoothed_xgboost_predictions$model_family <- "xgboost"
+smoothed_lstm_predictions$model_family <- "lstm"
 
 predictions <- rbind(
     arima_predictions,
     prophet_predictions,
     xgboost_predictions,
+    lstm_predictions,
     NULL
 )
 
@@ -1184,6 +1580,7 @@ smoothed_predictions <- rbind(
     smoothed_arima_predictions,
     smoothed_prophet_predictions,
     smoothed_xgboost_predictions,
+    smoothed_lstm_predictions,
     NULL
 )
 ```
